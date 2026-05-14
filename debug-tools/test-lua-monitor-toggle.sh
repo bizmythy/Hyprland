@@ -11,11 +11,16 @@ set -euo pipefail
 #        - PRTEST-1 starts enabled
 #        - PRTEST-2 starts disabled
 #   4. Binds ALT+1 and ALT+2 to toggle those monitor rules via Lua hl.monitor().
-#      Re-enabling a disabled output calls hl.monitor({ disabled = false }), which
-#      directly exercises the code path changed by PR #14447.
+#      It also exposes a terminal-driven request file so you do not have to rely
+#      on flaky nested-input capture to run the exact same Lua toggle code.
+#      The toggle derives state from hl.get_monitor(name), like a real config that
+#      reapplies enabled/disabled monitor profiles, instead of keeping separate
+#      test-only state. Re-enabling a disabled output calls
+#      hl.monitor({ disabled = false }), directly exercising PR #14447.
 #
-# Expected with the PR/fix: pressing ALT+2 makes PRTEST-2 appear; pressing it
-# again hides it. ALT+1 should similarly hide/show PRTEST-1.
+# Expected with the PR/fix: toggling PRTEST-1 disables it and leaves it disabled;
+# toggling PRTEST-2 enables it; toggling the same output again flips it back.
+
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -35,7 +40,9 @@ make debug
 
 TMPDIR="$(mktemp -d --tmpdir hyprland-lua-monitor-toggle.XXXXXX)"
 CONFIG="$TMPDIR/hyprland-pr14447.lua"
-LOG="$TMPDIR/hyprland.log"
+BOOT_LOG="$TMPDIR/hyprland-boot.log"
+LOG="$BOOT_LOG"
+REQUEST="$TMPDIR/toggle-request"
 
 cleanup() {
     set +e
@@ -58,11 +65,10 @@ cat >"$CONFIG" <<'LUA'
 
 local mon1 = "PRTEST-1"
 local mon2 = "PRTEST-2"
-local mon1_enabled = true
-local mon2_enabled = false
+local request_path = os.getenv("HYPR_MONITOR_TOGGLE_REQUEST")
 
 local function apply_monitor(name, enabled, x)
-    print(string.format("setting %s enabled=%s", name, tostring(enabled)))
+    print(string.format("MONITOR_TEST apply %s enabled=%s", name, tostring(enabled)))
     hl.monitor({
         output = name,
         mode = "1280x720@60",
@@ -72,9 +78,23 @@ local function apply_monitor(name, enabled, x)
     })
 end
 
+local function is_enabled(name)
+    -- Disabled outputs are not in hl.get_monitors()/hl.get_monitor(), so this
+    -- mirrors profile-style config: if it is currently present, disabling it is
+    -- the next toggle; if absent/disabled, apply a full enabled monitor spec.
+    return hl.get_monitor(name) ~= nil
+end
+
+local function toggle_monitor(name, x)
+    local currently_enabled = is_enabled(name)
+    local next_enabled = not currently_enabled
+    print(string.format("MONITOR_TEST toggle %s currently_enabled=%s next_enabled=%s", name, tostring(currently_enabled), tostring(next_enabled)))
+    apply_monitor(name, next_enabled, x)
+end
+
 -- Initial rules: monitor 1 enabled, monitor 2 disabled.
-apply_monitor(mon1, mon1_enabled, 0)
-apply_monitor(mon2, mon2_enabled, 1280)
+apply_monitor(mon1, true, 0)
+apply_monitor(mon2, false, 1280)
 
 hl.config({
     general = { gaps_in = 0, gaps_out = 0, border_size = 2 },
@@ -86,22 +106,62 @@ hl.config({
 })
 
 hl.bind("ALT + 1", function()
-    mon1_enabled = not mon1_enabled
-    apply_monitor(mon1, mon1_enabled, 0)
-    print("ALT+1 toggled " .. mon1 .. " -> enabled=" .. tostring(mon1_enabled))
+    print("MONITOR_TEST ALT+1 received")
+    toggle_monitor(mon1, 0)
 end)
 
 hl.bind("ALT + 2", function()
-    mon2_enabled = not mon2_enabled
-    apply_monitor(mon2, mon2_enabled, 1280)
-    print("ALT+2 toggled " .. mon2 .. " -> enabled=" .. tostring(mon2_enabled))
+    print("MONITOR_TEST ALT+2 received")
+    toggle_monitor(mon2, 1280)
 end)
 
 hl.bind("ALT + Q", hl.dsp.exit())
+
+hl.on("monitor.added", function(mon)
+    print("MONITOR_TEST event added " .. tostring(mon))
+end)
+
+hl.on("monitor.removed", function(mon)
+    print("MONITOR_TEST event removed " .. tostring(mon))
+end)
+
+hl.on("monitor.layout_changed", function()
+    print("MONITOR_TEST event layout_changed")
+end)
+
+-- Terminal-driven control path. The shell writes a unique line ending in
+-- " 1" or " 2" to this file. This avoids nested keyboard capture entirely
+-- while still executing the same in-compositor Lua hl.monitor() code.
+local last_request = ""
+if request_path ~= nil then
+    hl.timer(function()
+        local f = io.open(request_path, "r")
+        if f == nil then
+            return
+        end
+
+        local request = f:read("*a") or ""
+        f:close()
+
+        if request == "" or request == last_request then
+            return
+        end
+
+        last_request = request
+        if request:match("1%s*$") then
+            print("MONITOR_TEST terminal request 1 received")
+            toggle_monitor(mon1, 0)
+        elseif request:match("2%s*$") then
+            print("MONITOR_TEST terminal request 2 received")
+            toggle_monitor(mon2, 1280)
+        end
+    end, { timeout = 100, type = "repeat" })
+end
 LUA
 
 printf '\n==> Starting nested debug Hyprland with %s\n' "$CONFIG"
-HYPRLAND_NO_CRASHREPORTER=1 ASAN_OPTIONS="log_path=$TMPDIR/asan.log" ./build/Hyprland -c "$CONFIG" >"$LOG" 2>&1 &
+: >"$REQUEST"
+HYPR_MONITOR_TOGGLE_REQUEST="$REQUEST" HYPRLAND_NO_CRASHREPORTER=1 ASAN_OPTIONS="log_path=$TMPDIR/asan.log" ./build/Hyprland -c "$CONFIG" >"$BOOT_LOG" 2>&1 &
 HYPR_PID=$!
 
 printf '==> Waiting for hyprctl instance for PID %s\n' "$HYPR_PID"
@@ -129,7 +189,7 @@ PY
     [[ -n "$TEST_HIS" ]] && break
     if ! kill -0 "$HYPR_PID" 2>/dev/null; then
         echo "Hyprland exited early. Log follows:" >&2
-        sed -n '1,220p' "$LOG" >&2 || true
+        sed -n '1,220p' "$BOOT_LOG" >&2 || true
         exit 1
     fi
     sleep 0.1
@@ -141,31 +201,89 @@ if [[ -z "$TEST_HIS" ]]; then
 fi
 
 printf '==> Nested Hyprland instance: %s\n' "$TEST_HIS"
+SESSION_DIR="$XDG_RUNTIME_DIR/hypr/$TEST_HIS"
+for _ in {1..50}; do
+    if [[ -f "$SESSION_DIR/hyprlandd.log" ]]; then
+        LOG="$SESSION_DIR/hyprlandd.log"
+        break
+    elif [[ -f "$SESSION_DIR/hyprland.log" ]]; then
+        LOG="$SESSION_DIR/hyprland.log"
+        break
+    fi
+    sleep 0.1
+done
+printf '==> Hyprland session log: %s\n' "$LOG"
 
 printf '\n==> Creating two named Wayland test outputs\n'
 ./build/hyprctl/hyprctl -i "$TEST_HIS" output create wayland PRTEST-1 || true
 ./build/hyprctl/hyprctl -i "$TEST_HIS" output create wayland PRTEST-2 || true
 sleep 1
 
-printf '\n==> Initial monitor state (all monitors, including disabled)\n'
-./build/hyprctl/hyprctl -i "$TEST_HIS" monitors all || true
+
+print_monitor_state() {
+    local monitors_text
+    monitors_text="$(./build/hyprctl/hyprctl -i "$TEST_HIS" monitors all 2>/dev/null || true)"
+
+    printf '\n==> Concise enabled/disabled summary\n'
+    printf '%s\n' "$monitors_text" \
+        | awk '/^Monitor / { mon=$2 } /^[[:space:]]+disabled:/ { printf "  %s disabled=%s\n", mon, $2 }' || true
+
+
+    printf '\n==> Monitor state (all monitors, including disabled)\n'
+    printf '%s\n' "$monitors_text"
+    printf '\n==> Lua/test log lines\n'
+    if [[ -f "$LOG" ]]; then
+        grep -E 'MONITOR_TEST|Applying monitor rule|onDisconnect called for|Monitor .*disabled|requested to be enabled|layout_changed' "$LOG" | tail -n 100 || true
+    else
+        printf 'log file not found yet: %s\n' "$LOG"
+    fi
+}
+
+print_monitor_state
 
 cat <<EOF
 
 Test is running.
-  - You should see nested Hyprland output window(s), including PRTEST-1.
-  - PRTEST-2 is intentionally disabled by the loaded Lua config.
-  - Press Left Alt + 1 inside the nested Hyprland window to toggle PRTEST-1.
-  - Press Left Alt + 2 inside the nested Hyprland window to toggle PRTEST-2.
-  - Press Alt + Q inside nested Hyprland, or Ctrl+C here, to quit.
+  - WAYLAND-1 is the nested compositor's default output; leave it alone.
+  - PRTEST-1 starts enabled; PRTEST-2 starts disabled.
+  - For reliable testing, use THIS TERMINAL instead of captured nested input:
+      1  toggle PRTEST-1 by running the Lua hl.monitor() code
+      2  toggle PRTEST-2 by running the Lua hl.monitor() code
+      m  print monitor state
+      q  quit
+  - The nested keybinds still exist too: Left Alt+1, Left Alt+2, Alt+Q.
 
 Useful from another terminal while it runs:
   ./build/hyprctl/hyprctl -i "$TEST_HIS" monitors all
   tail -f "$LOG"
 
-If the review comment is correct / old behavior is present, the transition from
- disabled=true -> disabled=false will not actually re-enable the output. With PR
- #14447's commit, ALT+2 should enable PRTEST-2 without a full config reload.
+Important: this intentionally leaves the synthetic Wayland outputs connected and
+uses only Lua hl.monitor({ disabled = ... }) to toggle them. If a host-side
+nested output window remains visible after disabled=true, that is part of what
+this test is meant to expose.
 EOF
+
+while kill -0 "$HYPR_PID" 2>/dev/null; do
+    printf '\ncommand [1/2/m/q]> '
+    if ! IFS= read -r -n 1 key; then
+        break
+    fi
+    printf '\n'
+
+    case "$key" in
+        1|2)
+            printf '%s %s\n' "$(date +%s%N)" "$key" >"$REQUEST"
+            sleep 0.5
+            print_monitor_state
+            ;;
+        m|M)
+            print_monitor_state
+            ;;
+        q|Q)
+            ./build/hyprctl/hyprctl -i "$TEST_HIS" dispatch 'hl.dsp.exit()' >/dev/null 2>&1 || true
+            break
+            ;;
+    esac
+done
 
 wait "$HYPR_PID"
